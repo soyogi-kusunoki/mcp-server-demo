@@ -36,12 +36,14 @@ claude mcp add --transport http mcp-server-demo http://127.0.0.1:3000/mcp
 ## 構成
 
 ```
-src/index.ts    HTTP サーバー (Streamable HTTP の /mcp エンドポイント、Host/Origin 検証)
+src/index.ts    Express サーバー (Streamable HTTP の /mcp エンドポイント、Host/Origin 検証)
 src/server.ts   McpServer のファクトリ (ツール・リソース・プロンプトはここに登録)
 ```
 
 ## 使用パッケージ
 
 - `@modelcontextprotocol/server` — MCP サーバー本体 (v2)
-- `@modelcontextprotocol/node` — Node.js の `http` 向け Streamable HTTP アダプター
+- `@modelcontextprotocol/express` — Express アプリの生成 (JSON パース、Host/Origin 検証)
+- `@modelcontextprotocol/node` — Node.js の req/res 向け Streamable HTTP アダプター
+- `express` — HTTP サーバー
 - `zod` — ツール入力スキーマの定義
