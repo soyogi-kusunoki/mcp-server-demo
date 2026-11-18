@@ -1,34 +1,47 @@
-#!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { createServer as createHttpServer } from "node:http";
+import {
+  localhostHostValidation,
+  localhostOriginValidation,
+  toNodeHandler,
+} from "@modelcontextprotocol/node";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { createServer } from "./server.js";
 
-const server = new McpServer({
-  name: "mcp-server-demo",
-  version: "1.0.0",
+const HOST = process.env.HOST ?? "127.0.0.1";
+const PORT = Number(process.env.PORT ?? 3000);
+const MCP_PATH = "/mcp";
+
+// Streamable HTTP ハンドラ。2026-07-28 版プロトコルに加え、
+// 2025 年版クライアントにもステートレスに応答する。
+const mcpHandler = createMcpHandler(createServer, {
+  onerror: (error) => console.error("[mcp]", error),
+});
+const handleMcp = toNodeHandler(mcpHandler, {
+  onerror: (error) => console.error("[http]", error),
 });
 
-// 動作確認用のサンプルツール
-server.registerTool(
-  "hello",
-  {
-    title: "Hello",
-    description: "指定した名前に挨拶を返します",
-    inputSchema: { name: z.string().describe("挨拶する相手の名前") },
-  },
-  async ({ name }) => ({
-    content: [{ type: "text", text: `こんにちは、${name}さん！` }],
-  }),
-);
+// DNS リバインディング対策として Host / Origin ヘッダーを localhost に限定する
+const validateHost = localhostHostValidation();
+const validateOrigin = localhostOriginValidation();
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  // stdio トランスポートでは stdout が通信に使われるため、ログは stderr に出す
-  console.error("mcp-server-demo is running on stdio");
-}
+const httpServer = createHttpServer(async (req, res) => {
+  if (!validateHost(req, res) || !validateOrigin(req, res)) return;
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
+  const { pathname } = new URL(req.url ?? "/", `http://${req.headers.host}`);
+  if (pathname !== MCP_PATH) {
+    res.writeHead(404, { "Content-Type": "text/plain" }).end("Not Found");
+    return;
+  }
+
+  await handleMcp(req, res);
 });
+
+httpServer.listen(PORT, HOST, () => {
+  console.log(`mcp-server-demo listening on http://${HOST}:${PORT}${MCP_PATH}`);
+});
+
+const shutdown = () => {
+  httpServer.close(() => process.exit(0));
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

@@ -1,17 +1,21 @@
 # mcp-server-demo
 
 TypeScript で作成する MCP (Model Context Protocol) サーバーのデモです。
+[MCP TypeScript SDK v2](https://ts.sdk.modelcontextprotocol.io/v2/) を使い、Streamable HTTP で提供します。
 
 ## 必要環境
 
-- Node.js 18 以上
+- Node.js 20 以上
 
 ## セットアップ
 
 ```bash
 npm install
 npm run build
+npm start
 ```
+
+起動すると `http://127.0.0.1:3000/mcp` で待ち受けます。`HOST` / `PORT` 環境変数で変更できます。
 
 ## スクリプト
 
@@ -19,25 +23,25 @@ npm run build
 | --- | --- |
 | `npm run build` | `src/` を `build/` にコンパイル |
 | `npm run dev` | tsx で `src/index.ts` をウォッチ実行 |
-| `npm start` | ビルド済みサーバーを起動 (stdio) |
+| `npm start` | ビルド済みサーバーを起動 |
 | `npm run typecheck` | 型チェックのみ実行 |
-| `npm run inspect` | MCP Inspector でサーバーを確認 |
+| `npm run inspect` | MCP Inspector を起動 (Transport に Streamable HTTP、URL に `http://127.0.0.1:3000/mcp` を指定) |
 
-## Claude Code / Claude Desktop への登録例
+## Claude Code への登録例
 
-```json
-{
-  "mcpServers": {
-    "mcp-server-demo": {
-      "command": "node",
-      "args": ["/absolute/path/to/mcp-server-demo/build/index.js"]
-    }
-  }
-}
+```bash
+claude mcp add --transport http mcp-server-demo http://127.0.0.1:3000/mcp
 ```
 
 ## 構成
 
 ```
-src/index.ts   サーバー本体 (サンプルツール `hello` を登録)
+src/index.ts    HTTP サーバー (Streamable HTTP の /mcp エンドポイント、Host/Origin 検証)
+src/server.ts   McpServer のファクトリ (ツール・リソース・プロンプトはここに登録)
 ```
+
+## 使用パッケージ
+
+- `@modelcontextprotocol/server` — MCP サーバー本体 (v2)
+- `@modelcontextprotocol/node` — Node.js の `http` 向け Streamable HTTP アダプター
+- `zod` — ツール入力スキーマの定義
