@@ -27,5 +27,29 @@ export function createServer(): McpServer {
     }),
   );
 
+  // OAuth で認証されたユーザー・クライアントの情報を返すツール
+  server.registerTool(
+    "whoami",
+    {
+      title: "Who am I",
+      description: "アクセストークンから認証済みユーザーとクライアントの情報を返します",
+      inputSchema: z.object({}),
+    },
+    async (_args, ctx) => {
+      const authInfo = ctx.http?.authInfo;
+      const info = {
+        userId: authInfo?.extra?.sub,
+        clientId: authInfo?.clientId,
+        scopes: authInfo?.scopes,
+        expiresAt: authInfo?.expiresAt
+          ? new Date(authInfo.expiresAt * 1000).toISOString()
+          : undefined,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
+      };
+    },
+  );
+
   return server;
 }
