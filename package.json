@@ -8,7 +8,10 @@
     "dev": "tsx watch src/index.ts",
     "start": "node build/index.js",
     "typecheck": "tsc --noEmit",
-    "inspect": "npx @modelcontextprotocol/inspector"
+    "inspect": "npx @modelcontextprotocol/inspector",
+    "auth-server": "node build/auth-server/index.js",
+    "dev:auth": "tsx watch src/auth-server/index.ts",
+    "demo": "tsx scripts/demo.ts"
   },
   "repository": {
     "type": "git",
