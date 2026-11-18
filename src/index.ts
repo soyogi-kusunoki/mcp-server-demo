@@ -1,9 +1,5 @@
-import { createServer as createHttpServer } from "node:http";
-import {
-  localhostHostValidation,
-  localhostOriginValidation,
-  toNodeHandler,
-} from "@modelcontextprotocol/node";
+import { createMcpExpressApp } from "@modelcontextprotocol/express";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { createServer } from "./server.js";
 
@@ -20,23 +16,20 @@ const handleMcp = toNodeHandler(mcpHandler, {
   onerror: (error) => console.error("[http]", error),
 });
 
-// DNS リバインディング対策として Host / Origin ヘッダーを localhost に限定する
-const validateHost = localhostHostValidation();
-const validateOrigin = localhostOriginValidation();
+// localhost にバインドする場合、DNS リバインディング対策として
+// Host / Origin ヘッダーの検証が自動で有効になる。JSON ボディのパースも行う。
+const app = createMcpExpressApp({ host: HOST });
 
-const httpServer = createHttpServer(async (req, res) => {
-  if (!validateHost(req, res) || !validateOrigin(req, res)) return;
-
-  const { pathname } = new URL(req.url ?? "/", `http://${req.headers.host}`);
-  if (pathname !== MCP_PATH) {
-    res.writeHead(404, { "Content-Type": "text/plain" }).end("Not Found");
-    return;
-  }
-
-  await handleMcp(req, res);
+// GET (SSE) / POST / DELETE をすべて MCP ハンドラに渡す
+app.all(MCP_PATH, async (req, res) => {
+  await handleMcp(req, res, req.body);
 });
 
-httpServer.listen(PORT, HOST, () => {
+app.use((_req, res) => {
+  res.status(404).type("text/plain").send("Not Found");
+});
+
+const httpServer = app.listen(PORT, HOST, () => {
   console.log(`mcp-server-demo listening on http://${HOST}:${PORT}${MCP_PATH}`);
 });
 
