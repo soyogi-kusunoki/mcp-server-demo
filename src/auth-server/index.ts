@@ -3,7 +3,7 @@
  *
  * 対応している仕様:
  *  - RFC 8414 Authorization Server Metadata (/.well-known/oauth-authorization-server)
- *  - RFC 7591 Dynamic Client Registration (/register)
+ *  - Client ID Metadata Documents (client_id = クライアントのメタデータ文書の URL。事前登録不要)
  *  - Authorization Code Grant + PKCE (S256 必須) (/authorize, /token)
  *  - Refresh Token Grant (ローテーションあり)
  *  - RFC 8707 Resource Indicators (resource パラメーター → トークンの aud)
@@ -14,15 +14,13 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
-  accessTokens,
-  authorizationCodes,
-  clients,
-  randomToken,
-  refreshTokens,
-  s256,
-  safeEqual,
-  type RegisteredClient,
-} from "./store.js";
+  ClientMetadataError,
+  isLoopbackHost,
+  isRedirectUriAllowed,
+  resolveClient,
+  type ClientMetadata,
+} from "./client-metadata.js";
+import { accessTokens, authorizationCodes, randomToken, refreshTokens, s256, safeEqual } from "./store.js";
 
 const HOST = process.env.AUTH_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.AUTH_PORT ?? 4000);
@@ -47,7 +45,6 @@ const metadata = {
   issuer: ISSUER,
   authorization_endpoint: `${ISSUER}/authorize`,
   token_endpoint: `${ISSUER}/token`,
-  registration_endpoint: `${ISSUER}/register`,
   introspection_endpoint: `${ISSUER}/introspect`,
   response_types_supported: ["code"],
   response_modes_supported: ["query"],
@@ -56,6 +53,9 @@ const metadata = {
   token_endpoint_auth_methods_supported: ["none"],
   introspection_endpoint_auth_methods_supported: ["client_secret_basic"],
   scopes_supported: SUPPORTED_SCOPES,
+  // client_id として Client ID Metadata Document の URL を受け付ける
+  client_id_metadata_document_supported: true,
+  authorization_response_iss_parameter_supported: true,
   service_documentation: "https://github.com/soyogi-kusunoki/mcp-server-demo",
 };
 
@@ -131,51 +131,12 @@ function redirectWith(res: ServerResponse, redirectUri: string, params: Record<s
 }
 
 // ---------------------------------------------------------------------------
-// /register — Dynamic Client Registration (RFC 7591)
-// ---------------------------------------------------------------------------
-
-async function handleRegister(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse((await readBody(req)) || "{}");
-  } catch {
-    return sendOAuthError(res, 400, "invalid_client_metadata", "body must be JSON");
-  }
-
-  const redirectUris = body.redirect_uris;
-  if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every((u) => typeof u === "string")) {
-    return sendOAuthError(res, 400, "invalid_redirect_uri", "redirect_uris is required");
-  }
-  for (const uri of redirectUris as string[]) {
-    try {
-      const u = new URL(uri);
-      if (u.hash) throw new Error("fragment not allowed");
-    } catch {
-      return sendOAuthError(res, 400, "invalid_redirect_uri", `invalid redirect_uri: ${uri}`);
-    }
-  }
-
-  const client: RegisteredClient = {
-    client_id: randomToken(16),
-    client_name: typeof body.client_name === "string" ? body.client_name : undefined,
-    redirect_uris: redirectUris as string[],
-    grant_types: ["authorization_code", "refresh_token"],
-    response_types: ["code"],
-    token_endpoint_auth_method: "none", // 公開クライアント (PKCE で保護)
-    scope: typeof body.scope === "string" ? body.scope : DEFAULT_SCOPE,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-  };
-  clients.set(client.client_id, client);
-  console.log(`[auth] registered client ${client.client_id} (${client.client_name ?? "unnamed"})`);
-  sendJson(res, 201, client);
-}
-
-// ---------------------------------------------------------------------------
 // /authorize — 認可エンドポイント (ログイン + 同意画面)
 // ---------------------------------------------------------------------------
 
 interface AuthorizeRequest {
-  client: RegisteredClient;
+  clientId: string;
+  client: ClientMetadata;
   redirectUri: string;
   state?: string;
   codeChallenge: string;
@@ -189,13 +150,22 @@ type ValidationResult =
   | { ok: false; redirect: false; message: string }
   | { ok: false; redirect: true; redirectUri: string; state?: string; error: string; message: string };
 
-function validateAuthorizeParams(p: Record<string, string | undefined>): ValidationResult {
-  const client = p.client_id ? clients.get(p.client_id) : undefined;
-  if (!client) return { ok: false, redirect: false, message: "unknown client_id" };
+async function validateAuthorizeParams(p: Record<string, string | undefined>): Promise<ValidationResult> {
+  if (!p.client_id) return { ok: false, redirect: false, message: "client_id is required" };
 
-  const redirectUri = p.redirect_uri ?? (client.redirect_uris.length === 1 ? client.redirect_uris[0] : undefined);
-  if (!redirectUri || !client.redirect_uris.includes(redirectUri)) {
-    return { ok: false, redirect: false, message: "redirect_uri is not registered for this client" };
+  // client_id の URL から Client ID Metadata Document を取得して検証する
+  let client: ClientMetadata;
+  try {
+    client = await resolveClient(p.client_id);
+  } catch (error) {
+    if (error instanceof ClientMetadataError) return { ok: false, redirect: false, message: error.message };
+    throw error;
+  }
+
+  const redirectUri = p.redirect_uri;
+  if (!redirectUri) return { ok: false, redirect: false, message: "redirect_uri is required" };
+  if (!isRedirectUriAllowed(client, redirectUri)) {
+    return { ok: false, redirect: false, message: "redirect_uri is not listed in the client metadata document" };
   }
 
   const fail = (error: string, message: string): ValidationResult => ({
@@ -230,7 +200,7 @@ function validateAuthorizeParams(p: Record<string, string | undefined>): Validat
 
   return {
     ok: true,
-    value: { client, redirectUri, state: p.state, codeChallenge: p.code_challenge, scopes, resource },
+    value: { clientId: p.client_id, client, redirectUri, state: p.state, codeChallenge: p.code_challenge, scopes, resource },
   };
 }
 
@@ -239,7 +209,13 @@ function renderLoginPage(params: Record<string, string>, req: AuthorizeRequest, 
     .filter(([k]) => !["username", "password", "action"].includes(k))
     .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
     .join("\n      ");
-  const clientName = escapeHtml(req.client.client_name ?? req.client.client_id);
+  const clientHost = new URL(req.clientId).host;
+  const clientName = escapeHtml(req.client.client_name ?? clientHost);
+  const clientUri = req.client.client_uri;
+  // logo は client_id と同じホストのものだけ表示する (なりすまし対策)
+  const logoUri =
+    req.client.logo_uri && new URL(req.client.logo_uri).host === clientHost ? req.client.logo_uri : undefined;
+  const isLocalApp = isLoopbackHost(new URL(req.redirectUri).hostname);
   return `<!doctype html>
 <html lang="ja">
 <head>
@@ -255,6 +231,10 @@ function renderLoginPage(params: Record<string, string>, req: AuthorizeRequest, 
     input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
     .scopes { background: #f7f7fa; border-radius: 6px; padding: 10px 12px; font-size: .85rem; margin: 16px 0; word-break: break-all; }
     .err { color: #b00020; font-size: .9rem; }
+    .logo { border-radius: 8px; margin-bottom: 8px; }
+    .client { font-size: .85rem; border: 1px solid #e3e5ea; border-radius: 6px; padding: 10px 12px; word-break: break-all; }
+    .client .cid { color: #666; margin-top: 4px; }
+    .client .warn { color: #8a5a00; background: #fff6e0; border-radius: 4px; padding: 6px 8px; margin-top: 8px; }
     .row { display: flex; gap: 8px; margin-top: 16px; }
     button { flex: 1; padding: 10px; border: 0; border-radius: 6px; font-size: 1rem; cursor: pointer; }
     button.primary { background: #3b5bdb; color: #fff; }
@@ -265,7 +245,15 @@ function renderLoginPage(params: Record<string, string>, req: AuthorizeRequest, 
 <body>
   <form class="card" method="post" action="/authorize">
     <h1>Demo Auth Server</h1>
+    ${logoUri ? `<img class="logo" src="${escapeHtml(logoUri)}" alt="" width="48" height="48">` : ""}
     <p class="sub"><strong>${clientName}</strong> がアクセスを求めています</p>
+    <div class="client">
+      <div>提供元: <strong>${escapeHtml(clientHost)}</strong>${
+        clientUri ? ` (<a href="${escapeHtml(clientUri)}" target="_blank" rel="noopener noreferrer">${escapeHtml(clientUri)}</a>)` : ""
+      }</div>
+      <div class="cid">client_id: <code>${escapeHtml(req.clientId)}</code></div>
+      ${isLocalApp ? '<div class="warn">このアプリはお使いの PC 上で動作します。心当たりがない場合は拒否してください。</div>' : ""}
+    </div>
     ${errorMessage ? `<p class="err">${escapeHtml(errorMessage)}</p>` : ""}
     <div class="scopes">
       <div>スコープ: <code>${escapeHtml(req.scopes.join(" "))}</code></div>
@@ -295,7 +283,7 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse, url: U
   const params =
     req.method === "POST" ? await readParams(req) : Object.fromEntries(url.searchParams.entries());
 
-  const result = validateAuthorizeParams(params);
+  const result = await validateAuthorizeParams(params);
   if (!result.ok) {
     if (!result.redirect) return sendHtml(res, 400, renderErrorPage(result.message));
     return redirectWith(res, result.redirectUri, {
@@ -327,7 +315,7 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse, url: U
   const code = randomToken();
   authorizationCodes.set(code, {
     code,
-    clientId: authz.client.client_id,
+    clientId: authz.clientId,
     redirectUri: authz.redirectUri,
     codeChallenge: authz.codeChallenge,
     scopes: authz.scopes,
@@ -335,7 +323,7 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse, url: U
     sub: DEMO_USER,
     expiresAt: Date.now() + AUTH_CODE_TTL_MS,
   });
-  console.log(`[auth] user '${DEMO_USER}' approved client ${authz.client.client_id}`);
+  console.log(`[auth] user '${DEMO_USER}' approved client ${authz.clientId}`);
   redirectWith(res, authz.redirectUri, { code, state: authz.state });
 }
 
@@ -360,8 +348,9 @@ function issueTokens(clientId: string, scopes: string[], resource: string | unde
 
 async function handleToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const p = await readParams(req);
-  const client = p.client_id ? clients.get(p.client_id) : undefined;
-  if (!client) return sendOAuthError(res, 401, "invalid_client", "unknown client_id");
+  // 公開クライアントなのでクライアント認証は無し。認可コード/リフレッシュトークンの発行先 client_id と照合する
+  const clientId = p.client_id;
+  if (!clientId) return sendOAuthError(res, 401, "invalid_client", "client_id is required");
 
   if (p.grant_type === "authorization_code") {
     const record = p.code ? authorizationCodes.get(p.code) : undefined;
@@ -371,10 +360,10 @@ async function handleToken(req: IncomingMessage, res: ServerResponse): Promise<v
     if (!record || record.expiresAt < Date.now()) {
       return sendOAuthError(res, 400, "invalid_grant", "authorization code is invalid or expired");
     }
-    if (record.clientId !== client.client_id) {
+    if (record.clientId !== clientId) {
       return sendOAuthError(res, 400, "invalid_grant", "authorization code was issued to another client");
     }
-    if (p.redirect_uri !== undefined && p.redirect_uri !== record.redirectUri) {
+    if (p.redirect_uri !== record.redirectUri) {
       return sendOAuthError(res, 400, "invalid_grant", "redirect_uri mismatch");
     }
     if (!p.code_verifier || !safeEqual(s256(p.code_verifier), record.codeChallenge)) {
@@ -383,13 +372,13 @@ async function handleToken(req: IncomingMessage, res: ServerResponse): Promise<v
     if (p.resource && p.resource !== record.resource) {
       return sendOAuthError(res, 400, "invalid_target", "resource does not match the authorization request");
     }
-    console.log(`[auth] issued tokens to client ${client.client_id}`);
-    return sendJson(res, 200, issueTokens(client.client_id, record.scopes, record.resource, record.sub));
+    console.log(`[auth] issued tokens to client ${clientId}`);
+    return sendJson(res, 200, issueTokens(clientId, record.scopes, record.resource, record.sub));
   }
 
   if (p.grant_type === "refresh_token") {
     const record = p.refresh_token ? refreshTokens.get(p.refresh_token) : undefined;
-    if (!record || record.clientId !== client.client_id) {
+    if (!record || record.clientId !== clientId) {
       return sendOAuthError(res, 400, "invalid_grant", "refresh token is invalid");
     }
     if (p.resource && p.resource !== record.resource) {
@@ -404,8 +393,8 @@ async function handleToken(req: IncomingMessage, res: ServerResponse): Promise<v
     }
     // リフレッシュトークンのローテーション (公開クライアント向け、OAuth 2.1)
     refreshTokens.delete(record.token);
-    console.log(`[auth] refreshed tokens for client ${client.client_id}`);
-    return sendJson(res, 200, issueTokens(client.client_id, scopes, record.resource, record.sub));
+    console.log(`[auth] refreshed tokens for client ${clientId}`);
+    return sendJson(res, 200, issueTokens(clientId, scopes, record.resource, record.sub));
   }
 
   sendOAuthError(res, 400, "unsupported_grant_type", `unsupported grant_type: ${p.grant_type ?? "(none)"}`);
@@ -470,8 +459,6 @@ const server = createServer(async (req, res) => {
       case "GET /.well-known/oauth-authorization-server":
       case "GET /.well-known/openid-configuration":
         return sendJson(res, 200, metadata, { "Cache-Control": "max-age=60" });
-      case "POST /register":
-        return await handleRegister(req, res);
       case "GET /authorize":
       case "POST /authorize":
         return await handleAuthorize(req, res, url);
@@ -493,7 +480,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`demo auth server listening on http://${HOST}:${PORT} (issuer: ${ISSUER})`);
   console.log(`  demo user: ${DEMO_USER} / ${DEMO_PASSWORD}`);
-  console.log("  ※ デモ専用: データはインメモリで、再起動すると登録・トークンは消えます");
+  console.log("  ※ デモ専用: データはインメモリで、再起動するとトークンは消えます");
 });
 
 const shutdown = () => server.close(() => process.exit(0));

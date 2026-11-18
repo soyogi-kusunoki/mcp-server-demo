@@ -5,20 +5,9 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
  * 本番環境では永続化ストアやトークンのハッシュ保存などを検討すること。
  */
 
-export interface RegisteredClient {
-  client_id: string;
-  client_name?: string;
-  redirect_uris: string[];
-  grant_types: string[];
-  response_types: string[];
-  token_endpoint_auth_method: "none";
-  scope?: string;
-  client_id_issued_at: number;
-}
-
 export interface AuthorizationCode {
   code: string;
-  clientId: string;
+  clientId: string; // Client ID Metadata Document の URL
   redirectUri: string;
   codeChallenge: string;
   scopes: string[];
@@ -44,7 +33,6 @@ export interface RefreshToken {
   sub: string;
 }
 
-export const clients = new Map<string, RegisteredClient>();
 export const authorizationCodes = new Map<string, AuthorizationCode>();
 export const accessTokens = new Map<string, AccessToken>();
 export const refreshTokens = new Map<string, RefreshToken>();
